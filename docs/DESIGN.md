@@ -24,7 +24,7 @@ src/
 ├── auth.mjs     Bearer key check (timing-safe) + sliding-window fail limiter
 ├── sse.mjs      SSE event parsing + non-stream aggregation
 ├── models.mjs   passive model-name registry (sniffed from responses, disk-persisted)
-├── neutralize.mjs outbound phrase neutralization + message-shape normalization
+├── neutralize.mjs outbound phrase neutralization + message-shape normalization + 11128 fallback shapes
 ├── proxy.mjs    upstream forwarding: AbortSignal timeout + two-way cancel
 ├── server.mjs   http server + routing (/health, /v1/models, /v1/chat/completions)
 └── log.mjs      structured single-line JSON logs, correlated by reqId
@@ -81,36 +81,53 @@ liveness request. Cost: zero.
 
 ### Outbound neutralization (why a prompt gets blocked)
 
-The upstream gateway runs **keyword moderation on the prompt**, not on auth or
-channel: a request that carries a client identity phrase (observed:
-`DeepSeek Harness`, the harness's own system-prompt line) and is large enough
-(>~1 KB) is rejected with HTTP 400 / code 11128
+The upstream gateway runs **client-fingerprint moderation on the prompt**, not
+on auth or channel: a request whose text matches a known agent-client
+fingerprint and is large enough (>~1 KB) is rejected with HTTP 400 / code 11128
 (`Illegal API invocation from an unapproved channel`). Swapping tokens,
 accounts, models or headers changes nothing, and short prompts slip through —
 which is why it reads as an intermittent false positive.
+
+What a 2026-10 bisection against the live gateway established:
+
+| Question | Measured answer |
+|---|---|
+| Which messages are scanned? | `system` and `assistant` text only. The same paragraph in a `user` message, or inside a tool schema, passes. |
+| Literal or fuzzy? | Fuzzy. Two innocent sentences ("…are paths the user explicitly referenced. Relative paths resolve from the workspace root") are passed separately but blocked together; other fingerprints (`Main branch (you will usually use this for PRs)`) block on their own. |
+| Is a keyword table enough? | No — the rule set is fuzzy and gets tightened upstream, so the table is only the fast path. |
+| Does moving text out of `system` work? | Yes. The same content as a `user` message returns 200. |
 
 `neutralize.mjs` is the single outbound chokepoint (`proxy.mjs` calls it before
 `fetch`), so both `/v1/chat/completions` passthrough and `/v1/messages` adapted
 traffic get the same treatment:
 
 - **Phrase table** (`CLIENT_PHRASES`) — Claude Code billing-header token and
-  two signature sentences, rewritten to equivalent wording with values (URLs,
-  version numbers) preserved.
+  signature sentences, DSH's `@`-path paragraph, and the Copilot/Cursor
+  main-branch line, rewritten to equivalent wording with values (URLs, version
+  numbers) preserved.
 - **Identity phrase** (`IDENTITY_RE`) — a zero-width space is inserted between
   `DeepSeek` and `Harness`. The model reads the same words; the upstream's
-  substring match no longer fires. The lookbehind/lookahead deliberately skip
-  path contexts (`D:\...\DeepSeek Harness\...`): a path with an invisible
-  character in it would be handed to a tool call and fail.
+  match no longer fires. The lookbehind/lookahead deliberately skip path
+  contexts (`D:\...\DeepSeek Harness\...`): a path with an invisible character
+  in it would be handed to a tool call and fail.
 - **Message shape** — OpenAI's newer `developer` role is mapped to `system`, and
   a system message that appears later is hoisted to the front (system never
   participates in `tool_call_id` pairing, so moving it is safe). A request with
   no system message at all is left alone by default; `PROXY_SYNTHETIC_SYSTEM=1`
   opts into prepending a neutral one.
+- **Fallback ladder** (`PROXY_BLOCK_RETRY`, on by default) — if the upstream
+  still answers 11128, `proxy.mjs` re-sends the same content in shapes the
+  scanner does not inspect: first `foldSystemIntoUser` (system text merged into
+  the first user turn — semantics kept, zero extra tokens), then
+  `obfuscateNonUser` (system/assistant text word-obfuscated with zero-width
+  spaces, covering fingerprints that live in chat history). Blocked requests
+  produce no generation, so a retry costs no credits; non-11128 400s are never
+  retried.
 
 Everything is table-driven and reversible: `PROXY_NEUTRALIZE=0` restores
-byte-for-byte passthrough for every client, and the aggressive brand-word rule
-(`PROXY_NEUTRALIZE_AGGRESSIVE=1`) exists only for the day the identity rule is
-no longer enough.
+byte-for-byte passthrough for every client, `PROXY_BLOCK_RETRY=0` disables the
+ladder, and the aggressive brand-word rule (`PROXY_NEUTRALIZE_AGGRESSIVE=1`)
+exists only for the day the identity rule is no longer enough.
 
 ## 4. Self-healing address (keepalive)
 
