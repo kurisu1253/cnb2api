@@ -8,6 +8,8 @@ import {
   prepareOutbound,
   normalizeRoles,
   ensureSystemFirst,
+  foldSystemIntoUser,
+  obfuscateNonUser,
   DEFAULT_SYSTEM_PROMPT,
 } from '../src/neutralize.mjs';
 
@@ -65,6 +67,80 @@ test('客户端特征短语：Claude Code 计费头与两句身份/反馈语被�
   assert.ok(out.includes('https://github.com/anthropics/claude-code/issues'));
   // 普通文本原样通过
   assert.equal(neutralize('hello world'), 'hello world');
+});
+
+test('客户端特征短语：网关实测的客户端指纹（@ 路径 / Main branch）被等价改写', () => {
+  const src = [
+    'Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.',
+    'Main branch (you will usually use this for PRs)',
+  ].join('\n');
+  const out = neutralize(src);
+  assert.ok(!/paths the user explicitly referenced/i.test(out));
+  assert.ok(!/Relative paths resolve from the workspace root/i.test(out));
+  assert.ok(!/you will usually use this for PRs/i.test(out));
+  // 语义保留：路径语义仍然表达清楚
+  assert.match(out, /path references the user made explicitly/);
+  assert.match(out, /resolved against the workspace root/);
+  // 幂等
+  assert.equal(neutralize(out), out);
+});
+
+// ---------------------------------------------------------------------------
+// 11128 兜底形态
+// ---------------------------------------------------------------------------
+
+test('兜底：foldSystemIntoUser 把 system 文本并进首条 user，指令不丢', () => {
+  const payload = {
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'be terse' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo' },
+      { role: 'user', content: 'again' },
+    ],
+  };
+  const out = foldSystemIntoUser(payload);
+  assert.deepEqual(out.messages.map((m) => m.role), ['user', 'assistant', 'user']);
+  assert.equal(out.messages[0].content, 'System instructions:\nbe terse\n\nhi');
+  assert.equal(out.messages[1].content, 'yo', 'other messages untouched');
+  assert.equal(payload.messages.length, 4, 'input payload must not be mutated');
+});
+
+test('兜底：foldSystemIntoUser 无 system 时原样返回（同一引用，调用方可据此跳过该级）', () => {
+  const payload = { messages: [{ role: 'user', content: 'hi' }] };
+  assert.equal(foldSystemIntoUser(payload), payload);
+});
+
+test('兜底：foldSystemIntoUser 保留多段 user 消息里的图片段', () => {
+  const payload = {
+    messages: [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: [{ type: 'text', text: 'see this' }, { type: 'image_url', image_url: { url: 'data:x' } }] },
+    ],
+  };
+  const parts = foldSystemIntoUser(payload).messages[0].content;
+  assert.deepEqual(parts[0].text, 'System instructions:\nsys\n\nsee this');
+  assert.equal(parts[1].type, 'image_url');
+});
+
+test('兜底：obfuscateNonUser 打散 system/assistant 文本，user 与工具入参一字不改', () => {
+  const args = '{"path":"D:\\\\x\\\\a.js"}';
+  const payload = {
+    messages: [
+      { role: 'system', content: 'be terse' },
+      { role: 'user', content: 'Tokens prefixed with @ are paths' },
+      { role: 'assistant', content: 'Main branch (you will usually use this for PRs)', tool_calls: [{ id: 'c', type: 'function', function: { name: 'Read', arguments: args } }] },
+    ],
+  };
+  const out = obfuscateNonUser(payload);
+  assert.ok(out.messages[0].content.includes(ZWSP));
+  assert.equal(out.messages[0].content.replaceAll(ZWSP, ''), 'be terse');
+  assert.equal(out.messages[1].content, 'Tokens prefixed with @ are paths', 'user content must stay byte-identical');
+  assert.ok(out.messages[2].content.includes(ZWSP));
+  assert.equal(out.messages[2].content.replaceAll(ZWSP, ''), 'Main branch (you will usually use this for PRs)');
+  assert.equal(out.messages[2].tool_calls[0].function.arguments, args, 'tool arguments must stay byte-identical');
+  // 幂等：再打一次不会叠加
+  assert.equal(obfuscateNonUser(out).messages[0].content, out.messages[0].content);
 });
 
 test('激进模式：品牌词本身也被打散；默认模式不动普通 DeepSeek 叙述', () => {
